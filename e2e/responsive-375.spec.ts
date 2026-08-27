@@ -51,7 +51,10 @@ test.describe("Responsive @ 375px", () => {
     const buttons = page.locator("button, a[role='button'], input[type='submit']");
     const count = await buttons.count();
     for (let i = 0; i < count; i++) {
-      const box = await buttons.nth(i).boundingBox();
+      const el = buttons.nth(i);
+      // Skip Next.js dev-only overlay controls (not part of the app UI).
+      if ((await el.getAttribute("id")) === "next-logo") continue;
+      const box = await el.boundingBox();
       if (!box) continue;
       // Skip visually hidden / zero-size elements.
       if (box.width === 0 || box.height === 0) continue;

@@ -152,7 +152,7 @@ export default function Navbar() {
         <button
           onClick={() => setPaletteOpen(true)}
           aria-label="Search schedules"
-          className="sm:hidden text-zinc-400 hover:text-white transition-colors p-1.5"
+          className="sm:hidden text-zinc-400 hover:text-white transition-colors p-1.5 min-h-[44px] min-w-[44px] inline-flex items-center justify-center"
         >
           <SearchIcon />
         </button>
@@ -191,7 +191,7 @@ export default function Navbar() {
             aria-label="Select theme"
             aria-haspopup="true"
             aria-expanded={dropdownOpen}
-            className="text-zinc-400 hover:text-white transition-colors p-1.5 rounded-lg hover:bg-white/5 flex items-center justify-center"
+            className="text-zinc-400 hover:text-white transition-colors p-1.5 rounded-lg hover:bg-white/5 flex items-center justify-center min-h-[44px] min-w-[44px]"
           >
             {theme === "light" && <SunIcon />}
             {theme === "dark" && <MoonIcon />}
@@ -255,7 +255,7 @@ export default function Navbar() {
         {/* Hamburger button (mobile) */}
         <button
           onClick={() => setMenuOpen(v => !v)}
-          className="md:hidden text-zinc-400 hover:text-white transition-colors p-1.5"
+          className="md:hidden text-zinc-400 hover:text-white transition-colors p-1.5 min-h-[44px] min-w-[44px] inline-flex items-center justify-center"
           aria-label={menuOpen ? "Close menu" : "Open menu"}
           aria-expanded={menuOpen}
         >
@@ -283,7 +283,7 @@ export default function Navbar() {
           }}
           aria-label={NETWORK === "mainnet" ? "Network: Mainnet" : "Network: Testnet"}
           aria-expanded={networkTooltipOpen}
-          className={`sm:hidden inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full font-medium select-none ${NETWORK === "mainnet" ? "bg-green-500/10 text-green-400 border border-green-500/20" : "bg-yellow-500/10 text-yellow-400 border border-yellow-500/20"}`}
+          className={`sm:hidden inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full font-medium select-none min-h-[44px] ${NETWORK === "mainnet" ? "bg-green-500/10 text-green-400 border border-green-500/20" : "bg-yellow-500/10 text-yellow-400 border border-yellow-500/20"}`}
         >
           <span className={`inline-block w-1.5 h-1.5 rounded-full ${NETWORK === "mainnet" ? "bg-green-400" : "bg-yellow-400 animate-pulse"}`} aria-hidden="true" />
           {NETWORK === "mainnet" ? "Main" : "Test"}
