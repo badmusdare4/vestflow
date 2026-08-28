@@ -3644,6 +3644,46 @@ impl VestFlowContract {
         );
     }
 
+    /// Add funds to a streaming balance without changing the receiver configuration.
+    ///
+    /// Returns `AmountZero` if `amount <= 0`.
+    pub fn top_up(env: Env, account: Address, token: Address, amount: i128) -> Result<(), VestFlowError> {
+        account.require_auth();
+        if amount <= 0 {
+            return Err(VestFlowError::AmountZero);
+        }
+
+        token::Client::new(&env, &token).transfer(
+            &account,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        let balance_key = DataKey::StreamBalance(account.clone(), token.clone());
+        let funded: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&balance_key, &funded.checked_add(amount).expect("Stream balance overflow"));
+
+        if let Some(mut config) = env
+            .storage()
+            .instance()
+            .get::<DataKey, AccountTokenStreams>(&DataKey::AccountTokenStreams(account.clone(), token.clone()))
+        {
+            config.balance = config.balance.checked_add(amount).expect("Stream balance overflow");
+            env.storage()
+                .instance()
+                .set(&DataKey::AccountTokenStreams(account.clone(), token.clone()), &config);
+        }
+
+        env.events().publish(
+            (symbol_short!("top_up"), account, token),
+            amount,
+        );
+
+        Ok(())
+    }
+
     /// Settle the accrued drips for a (funder, token) pair.
     ///
     /// Advances the pair's independent settlement pointer to `now` and credits
@@ -8757,5 +8797,34 @@ mod test {
         // two active runs match continuous draining (10 * 100 = 1000).
         set_time(&env, 1200);
         assert_eq!(client.available_stream_balance(&funder, &token_address), 0);
+    }
+    #[test]
+    fn test_top_up_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, funder, receiver, token_address, _) = setup(&env);
+        
+        let receivers = soroban_sdk::vec![
+            &env,
+            StreamReceiver {
+                receiver: receiver.clone(),
+                amt_per_sec: 1,
+            }
+        ];
+        
+        client.set_stream(&funder, &token_address, &receivers, &100);
+        assert_eq!(client.available_stream_balance(&funder, &token_address), 100);
+        
+        client.top_up(&funder, &token_address, &50);
+        assert_eq!(client.available_stream_balance(&funder, &token_address), 150);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5)")]
+    fn test_top_up_zero_amount_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, funder, _, token_address, _) = setup(&env);
+        client.top_up(&funder, &token_address, &0);
     }
 }
