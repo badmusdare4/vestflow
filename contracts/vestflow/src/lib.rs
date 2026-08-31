@@ -46,8 +46,8 @@
 //! | `"Expiry must be in the future"` | `create_delegation` with `expires_at_ledger` at or before the current ledger sequence |
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, BytesN,
-    Env, IntoVal, String, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, xdr::ToXdr,
+    Address, Bytes, BytesN, Env, IntoVal, String, Vec,
 };
 
 /// Human-readable contract version, sourced from the `version` field in
@@ -88,6 +88,16 @@ pub enum VestFlowError {
     NftOwnerNotFound = 27,
     /// `split` was called for an account with no splits configured.
     NoSplits = 28,
+    /// `claim_schedule_slot` called for a leaf that has already claimed its slot.
+    SlotAlreadyClaimed = 29,
+    /// `claim_schedule_slot` called after a batch's `expiry_ledger` has passed.
+    BatchExpired = 30,
+    /// A Merkle proof did not resolve to the batch's committed root.
+    InvalidProof = 31,
+    /// `reclaim_batch` called before `expiry_ledger` has passed.
+    NotExpired = 32,
+    /// A Merkle proof exceeded the maximum supported depth (20).
+    ProofTooDeep = 33,
 }
 
 #[contracttype]
@@ -137,6 +147,23 @@ pub enum DataKey {
     Accrued(Address, Address),
     /// Index of (list_id, member) streams opened by a (funder, token).
     FunderStreams(Address, Address),
+    /// Committed Merkle root of a batch's beneficiary slots.
+    BatchRoot(u64),
+    /// Token deposited for a batch.
+    BatchToken(u64),
+    /// Grantor who committed a batch (and who may reclaim it after expiry).
+    BatchGrantor(u64),
+    /// Tokens still unclaimed in a batch. Decremented on each successful
+    /// `claim_schedule_slot`.
+    BatchRemaining(u64),
+    /// Ledger sequence after which unclaimed slots can no longer be claimed
+    /// and the grantor may reclaim the remaining balance.
+    BatchExpiry(u64),
+    /// Presence marks a leaf hash as already claimed, keyed globally by leaf
+    /// hash since leaves already commit to their batch via the Merkle root.
+    BatchSlotClaimed(BytesN<32>),
+    /// Monotonic counter of batches ever committed.
+    BatchCounter,
 }
 
 /// Storage keys for claim delegations, keyed separately from [`DataKey`] so
@@ -1006,6 +1033,280 @@ impl VestFlowContract {
             kind,
             revocable,
         ))
+    }
+
+    /// Deposit `total_amount` of `token` and commit a Merkle root encoding
+    /// every beneficiary slot in a batch. Immutable after this call.
+    ///
+    /// Each beneficiary later self-initialises their own schedule by calling
+    /// [`Self::claim_schedule_slot`] with a Merkle inclusion proof — the
+    /// grantor signs exactly once, regardless of how many beneficiaries the
+    /// batch covers.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AmountZero` if `total_amount` <= 0.
+    /// Panics with `"Expiry must be in the future"` if `expiry_ledger` is at
+    /// or before the current ledger sequence.
+    /// Returns `InvalidToken` if `token` is not a recognised Stellar Asset Contract.
+    pub fn commit_schedule_batch(
+        env: Env,
+        grantor: Address,
+        token: Address,
+        total_amount: i128,
+        merkle_root: BytesN<32>,
+        expiry_ledger: u32,
+    ) -> Result<u64, VestFlowError> {
+        grantor.require_auth();
+
+        Self::check_storage_headroom(&env)?;
+
+        if total_amount <= 0 {
+            return Err(VestFlowError::AmountZero);
+        }
+        assert!(
+            expiry_ledger > env.ledger().sequence(),
+            "Expiry must be in the future"
+        );
+
+        validate_token_sac(&env, &token)?;
+
+        let contract_address = env.current_contract_address();
+        token::Client::new(&env, &token).transfer(&grantor, &contract_address, &total_amount);
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BatchCounter)
+            .unwrap_or(0);
+        let id = count + 1;
+
+        env.storage().instance().set(&DataKey::BatchCounter, &id);
+        env.storage()
+            .instance()
+            .set(&DataKey::BatchRoot(id), &merkle_root);
+        env.storage()
+            .instance()
+            .set(&DataKey::BatchToken(id), &token);
+        env.storage()
+            .instance()
+            .set(&DataKey::BatchGrantor(id), &grantor);
+        env.storage()
+            .instance()
+            .set(&DataKey::BatchRemaining(id), &total_amount);
+        env.storage()
+            .instance()
+            .set(&DataKey::BatchExpiry(id), &expiry_ledger);
+
+        env.events().publish(
+            (symbol_short!("batchnew"), id),
+            (grantor, token, total_amount, merkle_root, expiry_ledger),
+        );
+
+        Ok(id)
+    }
+
+    /// Prove a beneficiary slot is included in a committed batch's Merkle
+    /// tree and create the corresponding vesting schedule.
+    ///
+    /// Internally performs the same storage writes as [`Self::create_schedule`],
+    /// funded from the batch's deposit rather than a fresh transfer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProofTooDeep` if `proof.len() > 20`, checked before any
+    /// hashing so a crafted deep proof cannot exhaust the instruction budget.
+    /// Returns `NotFound` if `batch_id` does not exist.
+    /// Returns `BatchExpired` if the current ledger is at or past the batch's
+    /// `expiry_ledger`.
+    /// Returns `SlotAlreadyClaimed` if this exact leaf has already claimed.
+    /// Returns `InvalidProof` if the proof does not resolve to the batch's
+    /// committed root.
+    /// Returns `AmountZero` if `total_amount` <= 0.
+    /// Returns `DurationZero`/`DurationTooShort` per [`validate_duration`].
+    /// Returns `CliffExceedsDuration` if `cliff_duration` > `duration`.
+    pub fn claim_schedule_slot(
+        env: Env,
+        batch_id: u64,
+        beneficiary: Address,
+        total_amount: i128,
+        duration: u64,
+        cliff_duration: u64,
+        start_time: u64,
+        vesting_kind: VestingKind,
+        revocable: bool,
+        proof: Vec<BytesN<32>>,
+    ) -> Result<u64, VestFlowError> {
+        beneficiary.require_auth();
+
+        // Bound the proof depth before any hashing to keep a crafted deep
+        // proof from exhausting the instruction budget before this check
+        // would otherwise fire.
+        if proof.len() > 20 {
+            return Err(VestFlowError::ProofTooDeep);
+        }
+
+        let root: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::BatchRoot(batch_id))
+            .ok_or(VestFlowError::NotFound)?;
+        let expiry_ledger: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BatchExpiry(batch_id))
+            .ok_or(VestFlowError::NotFound)?;
+
+        if env.ledger().sequence() >= expiry_ledger {
+            return Err(VestFlowError::BatchExpired);
+        }
+
+        if total_amount <= 0 {
+            return Err(VestFlowError::AmountZero);
+        }
+        validate_duration(duration)?;
+        if cliff_duration > duration {
+            return Err(VestFlowError::CliffExceedsDuration);
+        }
+
+        let leaf = schedule_leaf_hash(
+            &env,
+            &beneficiary,
+            total_amount,
+            duration,
+            cliff_duration,
+            start_time,
+            &vesting_kind,
+            revocable,
+        );
+
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::BatchSlotClaimed(leaf.clone()))
+        {
+            return Err(VestFlowError::SlotAlreadyClaimed);
+        }
+
+        let computed_root = verify_merkle_proof(&env, &leaf, &proof);
+        if computed_root != root {
+            return Err(VestFlowError::InvalidProof);
+        }
+
+        // Slot is proven and unclaimed: mark it claimed and debit the
+        // batch's remaining balance atomically within this invocation —
+        // Soroban's single-threaded execution model means no other
+        // invocation can observe `BatchRemaining` between this read and
+        // write, so two concurrent claims on the last slot cannot both pass.
+        env.storage()
+            .instance()
+            .set(&DataKey::BatchSlotClaimed(leaf), &());
+
+        let remaining: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BatchRemaining(batch_id))
+            .ok_or(VestFlowError::NotFound)?;
+        let remaining = remaining
+            .checked_sub(total_amount)
+            .expect("batch remaining underflow");
+        env.storage()
+            .instance()
+            .set(&DataKey::BatchRemaining(batch_id), &remaining);
+
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::BatchToken(batch_id))
+            .ok_or(VestFlowError::NotFound)?;
+        let grantor: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::BatchGrantor(batch_id))
+            .ok_or(VestFlowError::NotFound)?;
+
+        Ok(persist_funded_schedule(
+            &env,
+            grantor,
+            beneficiary,
+            token,
+            total_amount,
+            start_time,
+            duration,
+            cliff_duration,
+            cliff_duration,
+            vesting_kind,
+            revocable,
+        ))
+    }
+
+    /// Reclaim a batch's unclaimed deposit after `expiry_ledger` has passed.
+    ///
+    /// Transfers `BatchRemaining` back to the grantor and deletes the
+    /// batch's storage keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound` if `batch_id` does not exist.
+    /// Returns `NotExpired` if the current ledger is before `expiry_ledger`.
+    pub fn reclaim_batch(env: Env, batch_id: u64, grantor: Address) -> Result<(), VestFlowError> {
+        grantor.require_auth();
+
+        let stored_grantor: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::BatchGrantor(batch_id))
+            .ok_or(VestFlowError::NotFound)?;
+        assert!(stored_grantor == grantor, "Not the batch grantor");
+
+        let expiry_ledger: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BatchExpiry(batch_id))
+            .ok_or(VestFlowError::NotFound)?;
+        if env.ledger().sequence() < expiry_ledger {
+            return Err(VestFlowError::NotExpired);
+        }
+
+        let remaining: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BatchRemaining(batch_id))
+            .unwrap_or(0);
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::BatchToken(batch_id))
+            .ok_or(VestFlowError::NotFound)?;
+
+        if remaining > 0 {
+            token::Client::new(&env, &token).transfer(
+                &env.current_contract_address(),
+                &grantor,
+                &remaining,
+            );
+        }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::BatchRoot(batch_id));
+        env.storage()
+            .instance()
+            .remove(&DataKey::BatchToken(batch_id));
+        env.storage()
+            .instance()
+            .remove(&DataKey::BatchGrantor(batch_id));
+        env.storage()
+            .instance()
+            .remove(&DataKey::BatchRemaining(batch_id));
+        env.storage()
+            .instance()
+            .remove(&DataKey::BatchExpiry(batch_id));
+
+        env.events()
+            .publish((symbol_short!("reclaimed"), batch_id), (grantor, remaining));
+
+        Ok(())
     }
 
     /// Lock schedule parameters without transferring tokens.
@@ -1954,7 +2255,7 @@ impl VestFlowContract {
 
     /// Revoke a vesting schedule (grantor only, revocable schedules only).
     /// Unvested tokens are returned to the grantor. Already-vested tokens
-    /// remain claimable by the beneficiary.
+    /// are released to the beneficiary before returning the remainder to grantor.
     ///
     /// # Errors
     ///
@@ -1983,14 +2284,46 @@ impl VestFlowContract {
         schedule.revoked = true;
         schedule.vested_at_revoke = vested;
 
-        // Return unvested tokens to grantor
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &schedule.token);
+
+        let mut vested_released = 0;
+        let vested_unclaimed = vested - schedule.claimed_amount;
+        if vested_unclaimed > 0 {
+            let mut to_release = vested_unclaimed;
+            if schedule.requires_milestones {
+                let milestones: Vec<PerformanceMilestone> = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::PerformanceMilestones(schedule_id))
+                    .unwrap_or(vec![&env]);
+
+                let mut max_unlock_percentage: u32 = 0;
+                for milestone in milestones.iter() {
+                    if milestone.attested && milestone.unlock_percentage > max_unlock_percentage {
+                        max_unlock_percentage = milestone.unlock_percentage;
+                    }
+                }
+
+                let max_allowed = schedule
+                    .total_amount
+                    .checked_mul(max_unlock_percentage as i128)
+                    .and_then(|n| n.checked_div(100))
+                    .unwrap_or(0)
+                    - schedule.claimed_amount;
+
+                to_release = to_release.min(max_allowed.max(0));
+            }
+
+            if to_release > 0 {
+                schedule.claimed_amount += to_release;
+                vested_released = to_release;
+                token_client.transfer(&contract_address, &schedule.beneficiary, &to_release);
+            }
+        }
+
         if unvested > 0 {
-            let contract_address = env.current_contract_address();
-            token::Client::new(&env, &schedule.token).transfer(
-                &contract_address,
-                &schedule.grantor,
-                &unvested,
-            );
+            token_client.transfer(&contract_address, &schedule.grantor, &unvested);
         }
 
         env.storage()
@@ -2002,7 +2335,7 @@ impl VestFlowContract {
                 schedule.grantor.clone(),
                 schedule.token.clone(),
             ),
-            (schedule_id, unvested, vested),
+            (schedule_id, unvested, vested, vested_released),
         );
 
         Ok(())
@@ -3205,15 +3538,8 @@ impl VestFlowContract {
     ///
     /// Returns `None` if the list ID is unknown or if index is out of bounds.
     pub fn drips_list_entry(env: Env, list_id: u64, index: u32) -> Option<Address> {
-        let list: DripsList = env
-            .storage()
-            .instance()
-            .get(&DataKey::DripsList(list_id))?;
-        if index < list.members.len() {
-            Some(list.members.get(index).unwrap())
-        } else {
-            None
-        }
+        let list: DripsList = env.storage().instance().get(&DataKey::DripsList(list_id))?;
+        list.members.get(index)
     }
 
     /// Add a member address to a drips list.
@@ -3232,7 +3558,9 @@ impl VestFlowContract {
 
         if !list.members.contains(&member) {
             list.members.push_back(member);
-            env.storage().instance().set(&DataKey::DripsList(list_id), &list);
+            env.storage()
+                .instance()
+                .set(&DataKey::DripsList(list_id), &list);
             env.storage().instance().extend_ttl(
                 INSTANCE_TTL_THRESHOLD_LEDGERS,
                 INSTANCE_TTL_EXTEND_TO_LEDGERS,
@@ -3256,7 +3584,7 @@ impl VestFlowContract {
 
         let mut idx_to_remove: Option<u32> = None;
         for i in 0..list.members.len() {
-            if list.members.get(i).unwrap() == member {
+            if list.members.get(i) == Some(member.clone()) {
                 idx_to_remove = Some(i);
                 break;
             }
@@ -3264,7 +3592,9 @@ impl VestFlowContract {
 
         if let Some(i) = idx_to_remove {
             list.members.remove(i);
-            env.storage().instance().set(&DataKey::DripsList(list_id), &list);
+            env.storage()
+                .instance()
+                .set(&DataKey::DripsList(list_id), &list);
             env.storage().instance().extend_ttl(
                 INSTANCE_TTL_THRESHOLD_LEDGERS,
                 INSTANCE_TTL_EXTEND_TO_LEDGERS,
@@ -3336,7 +3666,7 @@ impl VestFlowContract {
                 .instance()
                 .get(&index_key)
                 .unwrap_or_else(|| vec![&env]);
-            if !list_ids.contains(&list_id) {
+            if !list_ids.contains(list_id) {
                 list_ids.push_back(list_id);
                 env.storage().instance().set(&index_key, &list_ids);
             }
@@ -3353,7 +3683,9 @@ impl VestFlowContract {
             if !funder_index.contains(&entry) {
                 funder_index.push_back(entry);
             }
-            env.storage().instance().set(&funder_index_key, &funder_index);
+            env.storage()
+                .instance()
+                .set(&funder_index_key, &funder_index);
         }
 
         env.storage().instance().extend_ttl(
@@ -3369,7 +3701,9 @@ impl VestFlowContract {
 
     /// View helper to fetch a drips stream for a list member.
     pub fn get_drips_stream(env: Env, list_id: u64, member: Address) -> Option<DripsStream> {
-        env.storage().instance().get(&DataKey::DripsStream(list_id, member))
+        env.storage()
+            .instance()
+            .get(&DataKey::DripsStream(list_id, member))
     }
 
     /// Length of one drips cycle in seconds.
@@ -3479,12 +3813,7 @@ impl VestFlowContract {
     /// Return the current per-second drip rate from `sender` to `receiver` for `token`.
     ///
     /// Returns 0 for senders with no stream configured to `receiver` for `token`.
-    pub fn stream_rate_for(
-        env: Env,
-        sender: Address,
-        receiver: Address,
-        token: Address,
-    ) -> i128 {
+    pub fn stream_rate_for(env: Env, sender: Address, receiver: Address, token: Address) -> i128 {
         let mut rate: i128 = 0;
 
         let list_ids: Vec<u64> = env
@@ -3521,12 +3850,7 @@ impl VestFlowContract {
     }
 
     /// Check whether `sender` currently has an active (non-zero rate) stream configured to `receiver` for `token`.
-    pub fn is_stream_active(
-        env: Env,
-        sender: Address,
-        receiver: Address,
-        token: Address,
-    ) -> bool {
+    pub fn is_stream_active(env: Env, sender: Address, receiver: Address, token: Address) -> bool {
         Self::stream_rate_for(env, sender, receiver, token) > 0
     }
 
@@ -3566,9 +3890,7 @@ impl VestFlowContract {
     ) -> Option<AccountTokenStreams> {
         env.storage()
             .instance()
-            .get::<DataKey, AccountTokenStreams>(
-                &DataKey::AccountTokenStreams(funder, token),
-            )
+            .get::<DataKey, AccountTokenStreams>(&DataKey::AccountTokenStreams(funder, token))
     }
 
     /// Open or update a token-specific streams configuration for `funder`.
@@ -3591,7 +3913,10 @@ impl VestFlowContract {
         top_up: i128,
     ) {
         funder.require_auth();
-        assert!(!receivers.is_empty(), "At least one stream receiver required");
+        assert!(
+            !receivers.is_empty(),
+            "At least one stream receiver required"
+        );
         assert!(top_up >= 0, "Top-up must be non-negative");
 
         if top_up > 0 {
@@ -3602,18 +3927,20 @@ impl VestFlowContract {
             );
             let balance_key = DataKey::StreamBalance(funder.clone(), token.clone());
             let funded: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
-            env.storage()
-                .instance()
-                .set(&balance_key, &funded.checked_add(top_up).expect("Stream balance overflow"));
+            env.storage().instance().set(
+                &balance_key,
+                &funded.checked_add(top_up).expect("Stream balance overflow"),
+            );
         }
 
         let now = env.ledger().timestamp();
         let previous: Option<AccountTokenStreams> = env
             .storage()
             .instance()
-            .get::<DataKey, AccountTokenStreams>(
-                &DataKey::AccountTokenStreams(funder.clone(), token.clone()),
-            );
+            .get::<DataKey, AccountTokenStreams>(&DataKey::AccountTokenStreams(
+                funder.clone(),
+                token.clone(),
+            ));
         let balance = previous
             .map(|config| config.balance)
             .unwrap_or(0)
@@ -3628,12 +3955,10 @@ impl VestFlowContract {
             start_time: now,
             last_update: now,
         };
-        env.storage()
-            .instance()
-            .set(
-                &DataKey::AccountTokenStreams(funder.clone(), token.clone()),
-                &config,
-            );
+        env.storage().instance().set(
+            &DataKey::AccountTokenStreams(funder.clone(), token.clone()),
+            &config,
+        );
         env.storage().instance().extend_ttl(
             INSTANCE_TTL_THRESHOLD_LEDGERS,
             INSTANCE_TTL_EXTEND_TO_LEDGERS,
@@ -3666,9 +3991,10 @@ impl VestFlowContract {
         let mut config: AccountTokenStreams = env
             .storage()
             .instance()
-            .get::<DataKey, AccountTokenStreams>(
-                &DataKey::AccountTokenStreams(funder.clone(), token.clone()),
-            )
+            .get::<DataKey, AccountTokenStreams>(&DataKey::AccountTokenStreams(
+                funder.clone(),
+                token.clone(),
+            ))
             .expect("Streams not configured");
 
         let now = env.ledger().timestamp();
@@ -3712,20 +4038,16 @@ impl VestFlowContract {
             }
         }
 
-        env.storage()
-            .instance()
-            .set(
-                &DataKey::AccountTokenStreams(funder.clone(), token.clone()),
-                &config,
-            );
+        env.storage().instance().set(
+            &DataKey::AccountTokenStreams(funder.clone(), token.clone()),
+            &config,
+        );
         env.storage().instance().extend_ttl(
             INSTANCE_TTL_THRESHOLD_LEDGERS,
             INSTANCE_TTL_EXTEND_TO_LEDGERS,
         );
-        env.events().publish(
-            (symbol_short!("strm_recv"), funder, token),
-            capped,
-        );
+        env.events()
+            .publish((symbol_short!("strm_recv"), funder, token), capped);
 
         capped
     }
@@ -3747,18 +4069,19 @@ impl VestFlowContract {
                 &account,
                 &transfer_amount,
             );
-            env.storage()
-                .instance()
-                .set(&key, &accrued.checked_sub(transfer_amount).expect("Accrued underflow"));
+            env.storage().instance().set(
+                &key,
+                &accrued
+                    .checked_sub(transfer_amount)
+                    .expect("Accrued underflow"),
+            );
             env.storage().instance().extend_ttl(
                 INSTANCE_TTL_THRESHOLD_LEDGERS,
                 INSTANCE_TTL_EXTEND_TO_LEDGERS,
             );
         }
-        env.events().publish(
-            (symbol_short!("strm_col"), account, token),
-            transfer_amount,
-        );
+        env.events()
+            .publish((symbol_short!("strm_col"), account, token), transfer_amount);
 
         transfer_amount
     }
@@ -3916,7 +4239,9 @@ impl VestFlowContract {
             assert!(weight > 0, "Split receiver weight must be positive");
         }
         if receivers.is_empty() {
-            env.storage().instance().remove(&DataKey::Splits(account.clone()));
+            env.storage()
+                .instance()
+                .remove(&DataKey::Splits(account.clone()));
         } else {
             env.storage()
                 .instance()
@@ -3926,10 +4251,8 @@ impl VestFlowContract {
                 INSTANCE_TTL_EXTEND_TO_LEDGERS,
             );
         }
-        env.events().publish(
-            (symbol_short!("split_set"), account),
-            receivers.len(),
-        );
+        env.events()
+            .publish((symbol_short!("split_set"), account), receivers.len());
     }
 
     /// View helper returning the account's current splits configuration.
@@ -4211,6 +4534,95 @@ fn compute_merged_timeline(
     }
 }
 
+/// Discriminant byte for a [`VestingKind`] as encoded into a batch leaf
+/// hash. Stable across contract versions since it is part of the hashed
+/// leaf layout that off-chain proof builders must reproduce byte-for-byte.
+fn vesting_kind_byte(kind: &VestingKind) -> u8 {
+    match kind {
+        VestingKind::Linear => 0,
+        VestingKind::Cliff => 1,
+        VestingKind::LinearWithCliff => 2,
+        VestingKind::Graded => 3,
+    }
+}
+
+/// Raw last-32-bytes of an `Address`'s XDR encoding.
+///
+/// For an account address this is the raw ed25519 public key; for a
+/// contract address it is the contract's hash. Either way it is the same
+/// 32 bytes an off-chain builder recovers by StrKey-decoding the address,
+/// which is what [`crate::schedule_leaf_hash`] must match byte-for-byte.
+fn address_raw_bytes(env: &Env, address: &Address) -> BytesN<32> {
+    let xdr = address.clone().to_xdr(env);
+    let len = xdr.len();
+    xdr.slice(len - 32..len).try_into().expect("32 bytes")
+}
+
+/// Hash a batch leaf for a beneficiary's committed schedule slot.
+///
+/// Layout (all integers big-endian):
+/// `sha256(0x00 || beneficiary(32) || total_amount(16) || duration(8) ||
+/// cliff_duration(8) || start_time(8) || vesting_kind(1) || revocable(1))`.
+///
+/// The `0x00` domain separator distinguishes leaves from internal nodes
+/// (which are prefixed `0x01` in [`hash_merkle_node`]), preventing a
+/// second-preimage attack where an internal node is presented as a leaf.
+fn schedule_leaf_hash(
+    env: &Env,
+    beneficiary: &Address,
+    total_amount: i128,
+    duration: u64,
+    cliff_duration: u64,
+    start_time: u64,
+    vesting_kind: &VestingKind,
+    revocable: bool,
+) -> BytesN<32> {
+    let mut bytes = Bytes::new(env);
+    bytes.push_back(0x00);
+    bytes.append(&Bytes::from(address_raw_bytes(env, beneficiary)));
+    bytes.append(&Bytes::from_array(env, &total_amount.to_be_bytes()));
+    bytes.append(&Bytes::from_array(env, &duration.to_be_bytes()));
+    bytes.append(&Bytes::from_array(env, &cliff_duration.to_be_bytes()));
+    bytes.append(&Bytes::from_array(env, &start_time.to_be_bytes()));
+    bytes.push_back(vesting_kind_byte(vesting_kind));
+    bytes.push_back(if revocable { 1 } else { 0 });
+    env.crypto().sha256(&bytes).to_bytes()
+}
+
+/// Hash two sibling Merkle nodes with sorted-pair, domain-separated encoding:
+/// `sha256(0x01 || min(left, right) || max(left, right))`.
+///
+/// Sorting the pair before hashing means the off-chain proof builder does
+/// not need to track left/right order per level, only that both sides sort
+/// siblings the same way.
+fn hash_merkle_node(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
+    let left_arr: [u8; 32] = left.clone().into();
+    let right_arr: [u8; 32] = right.clone().into();
+    let (lo, hi): (&BytesN<32>, &BytesN<32>) = if left_arr <= right_arr {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let mut bytes = Bytes::new(env);
+    bytes.push_back(0x01);
+    bytes.append(&Bytes::from(lo.clone()));
+    bytes.append(&Bytes::from(hi.clone()));
+    env.crypto().sha256(&bytes).to_bytes()
+}
+
+/// Fold a Merkle proof up from `leaf` to the implied root.
+///
+/// Caller is responsible for bounding `proof.len()` (see
+/// [`VestFlowContract::claim_schedule_slot`]) before calling this, so the
+/// bound is enforced before any hashing work begins.
+fn verify_merkle_proof(env: &Env, leaf: &BytesN<32>, proof: &Vec<BytesN<32>>) -> BytesN<32> {
+    let mut computed = leaf.clone();
+    for sibling in proof.iter() {
+        computed = hash_merkle_node(env, &computed, &sibling);
+    }
+    computed
+}
+
 /// Validate that `token` is a recognised Stellar Asset Contract (SAC) by
 /// invoking the `decimals` method. Non-SAC addresses will cause the
 /// cross-contract call to fail, which we translate into `InvalidToken`.
@@ -4244,6 +4656,7 @@ fn resolve_nft_owner(
 
 #[cfg(test)]
 mod test {
+    extern crate std;
     use super::*;
     use proptest::prelude::*;
     use soroban_sdk::{
@@ -4558,15 +4971,15 @@ mod test {
         set_time(&env, 1000);
         assert_eq!(client.claimable(&id), 1000);
 
-        // Revoke after full vest — grantor gets nothing back
+        // Revoke after full vest — grantor gets nothing back, beneficiary receives full amount
         let grantor_before = token.balance(&grantor);
         client.revoke(&id);
         assert_eq!(token.balance(&grantor), grantor_before);
         assert!(client.get_schedule(&id).revoked);
 
-        // Beneficiary can still claim the full amount
-        client.claim(&id);
+        // Beneficiary already receives full amount upon revocation
         assert_eq!(token.balance(&beneficiary), 1000);
+        assert_eq!(client.claimable(&id), 0);
     }
 
     #[test]
@@ -4595,10 +5008,46 @@ mod test {
 
         client.revoke(&id);
         assert!(client.get_schedule(&id).revoked);
-        assert_eq!(client.claimable(&id), 250);
 
-        client.claim(&id);
+        // Already-vested tokens are automatically released to beneficiary on revoke
         assert_eq!(token.balance(&beneficiary), 250);
+        assert_eq!(client.claimable(&id), 0);
+    }
+
+    #[test]
+    fn test_revoke_after_cliff_releases_vested_tokens() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, grantor, beneficiary, token_addr, _) = setup(&env);
+        let token = TokenClient::new(&env, &token_addr);
+
+        // 1000s duration, 400s cliff, LinearWithCliff schedule
+        set_time(&env, 0);
+        let id = client.create_schedule(
+            &grantor,
+            &beneficiary,
+            &token_addr,
+            &1000,
+            &0,
+            &1000,
+            &400,
+            &400,
+            &VestingKind::LinearWithCliff,
+            &true,
+        );
+
+        // At t=700 (mid-vest after cliff): 50% through linear portion (300/600s) -> 500 tokens vested
+        set_time(&env, 700);
+        assert_eq!(client.claimable(&id), 500);
+
+        let grantor_before = token.balance(&grantor);
+        let beneficiary_before = token.balance(&beneficiary);
+        client.revoke(&id);
+
+        // Vested tokens released to beneficiary, remainder returned to grantor
+        assert_eq!(token.balance(&beneficiary), beneficiary_before + 500);
+        assert_eq!(token.balance(&grantor), grantor_before + 500);
+        assert!(client.get_schedule(&id).revoked);
         assert_eq!(client.claimable(&id), 0);
     }
 
@@ -6163,16 +6612,14 @@ mod test {
 
         // Revoke before claiming — grantor gets back the 500 unvested tokens
         let grantor_before = token.balance(&grantor);
+        let beneficiary_before = token.balance(&beneficiary);
         client.revoke(&id);
         let grantor_after = token.balance(&grantor);
-        assert_eq!(grantor_after - grantor_before, 500);
-        assert!(client.get_schedule(&id).revoked);
-
-        // Beneficiary can still claim the 500 vested-at-revoke tokens even after revocation
-        let beneficiary_before = token.balance(&beneficiary);
-        client.claim(&id);
         let beneficiary_after = token.balance(&beneficiary);
+        assert_eq!(grantor_after - grantor_before, 500);
         assert_eq!(beneficiary_after - beneficiary_before, 500);
+        assert!(client.get_schedule(&id).revoked);
+        assert_eq!(client.claimable(&id), 0);
     }
 
     #[test]
@@ -8078,17 +8525,26 @@ mod test {
         env.mock_all_auths();
         let (client, owner, _, _, _) = setup(&env);
 
-        let list_id = client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Core Contributors"));
+        let list_id = client.create_drips_list(
+            &owner,
+            &soroban_sdk::String::from_str(&env, "Core Contributors"),
+        );
         assert_eq!(list_id, 1);
 
         let list = client.get_drips_list(&list_id).unwrap();
         assert_eq!(list.id, 1);
         assert_eq!(list.owner, owner);
-        assert_eq!(list.name, soroban_sdk::String::from_str(&env, "Core Contributors"));
+        assert_eq!(
+            list.name,
+            soroban_sdk::String::from_str(&env, "Core Contributors")
+        );
         assert_eq!(list.members.len(), 0);
 
         // Duplicate name allowed -> yields unique ID 2
-        let list_id_2 = client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Core Contributors"));
+        let list_id_2 = client.create_drips_list(
+            &owner,
+            &soroban_sdk::String::from_str(&env, "Core Contributors"),
+        );
         assert_eq!(list_id_2, 2);
     }
 
@@ -8098,7 +8554,8 @@ mod test {
         env.mock_all_auths();
         let (client, owner, member1, _, _) = setup(&env);
 
-        let list_id = client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Dependencies"));
+        let list_id =
+            client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Dependencies"));
 
         // Empty list -> index 0 returns None
         assert_eq!(client.drips_list_entry(&list_id, &0), None);
@@ -8120,7 +8577,8 @@ mod test {
         let (client, owner, member1, _, _) = setup(&env);
         let member2 = Address::generate(&env);
 
-        let list_id = client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Dev Team"));
+        let list_id =
+            client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Dev Team"));
 
         client.add_to_drips_list(&owner, &list_id, &member1);
         client.add_to_drips_list(&owner, &list_id, &member2);
@@ -8150,7 +8608,8 @@ mod test {
         let (client, owner, member1, _, _) = setup(&env);
         let stranger = Address::generate(&env);
 
-        let list_id = client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Dev Team"));
+        let list_id =
+            client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Dev Team"));
         client.add_to_drips_list(&stranger, &list_id, &member1);
     }
 
@@ -8162,7 +8621,8 @@ mod test {
         let member2 = Address::generate(&env);
         let funder = owner.clone();
 
-        let list_id = client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Funded List"));
+        let list_id =
+            client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Funded List"));
 
         // Empty list -> fund_drips_list is a no-op
         client.fund_drips_list(&funder, &list_id, &token_address, &1000, &100);
@@ -8205,8 +8665,8 @@ mod test {
         // Nothing deposited yet.
         assert_eq!(client.total_balance(&token_address), 0);
 
-        let list_id = client
-            .create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Analytics"));
+        let list_id =
+            client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Analytics"));
         client.add_to_drips_list(&owner, &list_id, &member1);
         client.fund_drips_list(&owner, &list_id, &token_address, &10, &500);
 
@@ -8280,11 +8740,15 @@ mod test {
         }
 
         pub fn transfer(env: Env, to: Address, token_id: u128) {
-            env.storage().instance().set(&MockNftKey::Owner(token_id), &to);
+            env.storage()
+                .instance()
+                .set(&MockNftKey::Owner(token_id), &to);
         }
 
         pub fn mint(env: Env, to: Address, token_id: u128) {
-            env.storage().instance().set(&MockNftKey::Owner(token_id), &to);
+            env.storage()
+                .instance()
+                .set(&MockNftKey::Owner(token_id), &to);
         }
     }
 
@@ -8408,12 +8872,16 @@ mod test {
         assert!(!client.is_stream_active(&owner, &stranger, &token_address));
 
         // Create list and fund with rate 1000
-        let list_id = client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Streams"));
+        let list_id =
+            client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Streams"));
         client.add_to_drips_list(&owner, &list_id, &member1);
         client.fund_drips_list(&owner, &list_id, &token_address, &1000, &5000);
 
         // Active stream -> rate 1000, active
-        assert_eq!(client.stream_rate_for(&owner, &member1, &token_address), 1000);
+        assert_eq!(
+            client.stream_rate_for(&owner, &member1, &token_address),
+            1000
+        );
         assert!(client.is_stream_active(&owner, &member1, &token_address));
 
         // Set stream rate to 0
@@ -8428,7 +8896,10 @@ mod test {
         env.mock_all_auths();
         let (client, owner, member1, token_address, _) = setup(&env);
 
-        let list_id = client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Withdraw List"));
+        let list_id = client.create_drips_list(
+            &owner,
+            &soroban_sdk::String::from_str(&env, "Withdraw List"),
+        );
         client.add_to_drips_list(&owner, &list_id, &member1);
         client.fund_drips_list(&owner, &list_id, &token_address, &10, &1000);
 
@@ -8450,7 +8921,10 @@ mod test {
         env.mock_all_auths();
         let (client, owner, member1, token_address, _) = setup(&env);
 
-        let list_id = client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Overdraft List"));
+        let list_id = client.create_drips_list(
+            &owner,
+            &soroban_sdk::String::from_str(&env, "Overdraft List"),
+        );
         client.add_to_drips_list(&owner, &list_id, &member1);
         client.fund_drips_list(&owner, &list_id, &token_address, &10, &500);
 
@@ -8583,7 +9057,10 @@ mod test {
 
         let version = client.version();
         assert!(!version.is_empty());
-        assert_eq!(version, soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            version,
+            soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]
@@ -8726,7 +9203,8 @@ mod test {
         let (client, owner, member1, token_address, _) = setup(&env);
         let funder = owner.clone();
 
-        let list_id = client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Paused List"));
+        let list_id =
+            client.create_drips_list(&owner, &soroban_sdk::String::from_str(&env, "Paused List"));
         client.add_to_drips_list(&owner, &list_id, &member1);
 
         set_time(&env, 1000);
@@ -8734,7 +9212,10 @@ mod test {
 
         // 50 seconds active -> 10/sec drains 500, leaving 500 available.
         set_time(&env, 1050);
-        assert_eq!(client.available_stream_balance(&funder, &token_address), 500);
+        assert_eq!(
+            client.available_stream_balance(&funder, &token_address),
+            500
+        );
 
         // Pause drains immediately.
         client.pause_streams(&funder, &token_address);
@@ -8744,7 +9225,10 @@ mod test {
 
         // 100 seconds paused -> balance stays flat, no new drips delivered.
         set_time(&env, 1150);
-        assert_eq!(client.available_stream_balance(&funder, &token_address), 500);
+        assert_eq!(
+            client.available_stream_balance(&funder, &token_address),
+            500
+        );
 
         // Resume at the original rate; accounting resumes from the pause point.
         client.resume_streams(&funder, &token_address);
@@ -8757,5 +9241,567 @@ mod test {
         // two active runs match continuous draining (10 * 100 = 1000).
         set_time(&env, 1200);
         assert_eq!(client.available_stream_balance(&funder, &token_address), 0);
+    }
+
+    // ---- commit_schedule_batch / claim_schedule_slot / reclaim_batch ----
+
+    /// One committed slot's parameters, mirroring the arguments to
+    /// [`claim_schedule_slot`].
+    struct SlotParams {
+        beneficiary: Address,
+        total_amount: i128,
+        duration: u64,
+        cliff_duration: u64,
+        start_time: u64,
+        kind: VestingKind,
+        revocable: bool,
+    }
+
+    fn slot_leaf(env: &Env, p: &SlotParams) -> BytesN<32> {
+        schedule_leaf_hash(
+            env,
+            &p.beneficiary,
+            p.total_amount,
+            p.duration,
+            p.cliff_duration,
+            p.start_time,
+            &p.kind,
+            p.revocable,
+        )
+    }
+
+    /// Build a Merkle tree bottom-up over `leaves`, returning the root and,
+    /// for each leaf (by index), the sibling proof up to the root. Mirrors
+    /// the on-chain `hash_merkle_node` sorted-pair encoding exactly so
+    /// proofs produced here verify against [`VestFlowContract::claim_schedule_slot`].
+    fn build_merkle(env: &Env, leaves: &Vec<BytesN<32>>) -> (BytesN<32>, Vec<Vec<BytesN<32>>>) {
+        let n = leaves.len();
+        let mut proofs: Vec<Vec<BytesN<32>>> = Vec::new(env);
+        let mut positions: Vec<u32> = Vec::new(env);
+        for i in 0..n {
+            proofs.push_back(Vec::new(env));
+            positions.push_back(i);
+        }
+
+        let mut level: Vec<BytesN<32>> = leaves.clone();
+        while level.len() > 1 {
+            let len = level.len();
+            let mut new_level: Vec<BytesN<32>> = Vec::new(env);
+            let mut k: u32 = 0;
+            while k < len {
+                if k + 1 < len {
+                    let left = level.get(k).unwrap();
+                    let right = level.get(k + 1).unwrap();
+                    new_level.push_back(hash_merkle_node(env, &left, &right));
+                } else {
+                    // Odd leftover node is promoted unchanged; no sibling.
+                    new_level.push_back(level.get(k).unwrap());
+                }
+                k += 2;
+            }
+
+            // Each leaf's own position at this level directly determines its
+            // sibling (position XOR 1) and its position at the next level
+            // (position / 2) — O(n) per level instead of rescanning every
+            // position for every pair.
+            for i in 0..n {
+                let p = positions.get(i).unwrap();
+                let sibling_pos = p ^ 1;
+                if sibling_pos < len {
+                    let sibling = level.get(sibling_pos).unwrap();
+                    let mut pi = proofs.get(i).unwrap();
+                    pi.push_back(sibling);
+                    proofs.set(i, pi);
+                }
+                positions.set(i, p / 2);
+            }
+
+            level = new_level;
+        }
+
+        (level.get(0).unwrap(), proofs)
+    }
+
+    fn setup_batch(env: &Env) -> (VestFlowContractClient<'_>, Address, Address) {
+        let contract_id = env.register(VestFlowContract, ());
+        let client = VestFlowContractClient::new(env, &contract_id);
+        let grantor = Address::generate(env);
+        let token_admin = Address::generate(env);
+        let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+        let token_address = token_contract.address();
+        StellarAssetClient::new(env, &token_address)
+            .mock_all_auths()
+            .mint(&grantor, &10_000_000_000);
+        (client, grantor, token_address)
+    }
+
+    #[test]
+    fn test_commit_and_claim_single_slot() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, grantor, token) = setup_batch(&env);
+        let beneficiary = Address::generate(&env);
+
+        set_time(&env, 0);
+        let slot = SlotParams {
+            beneficiary: beneficiary.clone(),
+            total_amount: 1_000,
+            duration: 1_000,
+            cliff_duration: 0,
+            start_time: 0,
+            kind: VestingKind::Linear,
+            revocable: false,
+        };
+        let leaf = slot_leaf(&env, &slot);
+        let root = leaf.clone();
+
+        let batch_id = client.commit_schedule_batch(&grantor, &token, &1_000, &root, &1_000_000);
+
+        let empty_proof: Vec<BytesN<32>> = Vec::new(&env);
+        let schedule_id = client.claim_schedule_slot(
+            &batch_id,
+            &beneficiary,
+            &slot.total_amount,
+            &slot.duration,
+            &slot.cliff_duration,
+            &slot.start_time,
+            &slot.kind,
+            &slot.revocable,
+            &empty_proof,
+        );
+
+        let schedule = client.get_schedule(&schedule_id);
+        assert_eq!(schedule.beneficiary, beneficiary);
+        assert_eq!(schedule.grantor, grantor);
+        assert_eq!(schedule.total_amount, 1_000);
+    }
+
+    #[test]
+    fn test_commit_and_claim_all_slots_depth_10() {
+        // 1024 schedules would otherwise dump a multi-megabyte regression
+        // snapshot into the repo on every run; this test's value is in the
+        // assertions below, not a committed ledger snapshot.
+        let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
+            capture_snapshot_at_drop: false,
+        });
+        env.mock_all_auths();
+        // 1024 leaves plus 1024 on-chain claims comfortably exceeds a single
+        // transaction's CPU budget; this test asserts correctness of the
+        // tree/proof/claim logic across every slot, not per-invocation cost.
+        env.cost_estimate().budget().reset_unlimited();
+        let (client, grantor, token) = setup_batch(&env);
+
+        set_time(&env, 0);
+        const N: u32 = 1024;
+        let mut slots: std::vec::Vec<SlotParams> = std::vec::Vec::new();
+        let mut leaves: Vec<BytesN<32>> = Vec::new(&env);
+        let mut total: i128 = 0;
+        for i in 0..N {
+            let slot = SlotParams {
+                beneficiary: Address::generate(&env),
+                total_amount: 100 + i as i128,
+                duration: 1_000,
+                cliff_duration: 0,
+                start_time: 0,
+                kind: VestingKind::Linear,
+                revocable: false,
+            };
+            total += slot.total_amount;
+            leaves.push_back(slot_leaf(&env, &slot));
+            slots.push(slot);
+        }
+
+        let (root, proofs) = build_merkle(&env, &leaves);
+        let batch_id = client.commit_schedule_batch(&grantor, &token, &total, &root, &1_000_000);
+
+        let mut schedule_ids: std::vec::Vec<u64> = std::vec::Vec::new();
+        for i in 0..N {
+            let slot = &slots[i as usize];
+            let proof = proofs.get(i).unwrap();
+            let schedule_id = client.claim_schedule_slot(
+                &batch_id,
+                &slot.beneficiary,
+                &slot.total_amount,
+                &slot.duration,
+                &slot.cliff_duration,
+                &slot.start_time,
+                &slot.kind,
+                &slot.revocable,
+                &proof,
+            );
+            let schedule = client.get_schedule(&schedule_id);
+            assert_eq!(schedule.beneficiary, slot.beneficiary);
+            assert_eq!(schedule.total_amount, slot.total_amount);
+            schedule_ids.push(schedule_id);
+        }
+
+        for i in 0..schedule_ids.len() {
+            for j in (i + 1)..schedule_ids.len() {
+                assert_ne!(schedule_ids[i], schedule_ids[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_invalid_proof_wrong_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, grantor, token) = setup_batch(&env);
+        let beneficiary = Address::generate(&env);
+
+        set_time(&env, 0);
+        let slot = SlotParams {
+            beneficiary: beneficiary.clone(),
+            total_amount: 1_000,
+            duration: 1_000,
+            cliff_duration: 0,
+            start_time: 0,
+            kind: VestingKind::Linear,
+            revocable: false,
+        };
+        let leaf = slot_leaf(&env, &slot);
+        let batch_id = client.commit_schedule_batch(&grantor, &token, &1_000, &leaf, &1_000_000);
+
+        let empty_proof: Vec<BytesN<32>> = Vec::new(&env);
+        let result = client.try_claim_schedule_slot(
+            &batch_id,
+            &beneficiary,
+            &2_000, // wrong amount
+            &slot.duration,
+            &slot.cliff_duration,
+            &slot.start_time,
+            &slot.kind,
+            &slot.revocable,
+            &empty_proof,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), VestFlowError::InvalidProof);
+    }
+
+    #[test]
+    fn test_invalid_proof_tampered_node() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, grantor, token) = setup_batch(&env);
+
+        set_time(&env, 0);
+        let mut slots: std::vec::Vec<SlotParams> = std::vec::Vec::new();
+        let mut leaves: Vec<BytesN<32>> = Vec::new(&env);
+        for i in 0..4u32 {
+            let slot = SlotParams {
+                beneficiary: Address::generate(&env),
+                total_amount: 100 + i as i128,
+                duration: 1_000,
+                cliff_duration: 0,
+                start_time: 0,
+                kind: VestingKind::Linear,
+                revocable: false,
+            };
+            leaves.push_back(slot_leaf(&env, &slot));
+            slots.push(slot);
+        }
+        let (root, proofs) = build_merkle(&env, &leaves);
+        let total: i128 = slots.iter().map(|s| s.total_amount).sum();
+        let batch_id = client.commit_schedule_batch(&grantor, &token, &total, &root, &1_000_000);
+
+        let slot0 = &slots[0];
+        let mut tampered = proofs.get(0).unwrap();
+        // Flip a bit in the first sibling hash.
+        let mut sibling = tampered.get(0).unwrap();
+        let mut arr: [u8; 32] = sibling.clone().into();
+        arr[0] ^= 0xFF;
+        sibling = BytesN::from_array(&env, &arr);
+        tampered.set(0, sibling);
+
+        let result = client.try_claim_schedule_slot(
+            &batch_id,
+            &slot0.beneficiary,
+            &slot0.total_amount,
+            &slot0.duration,
+            &slot0.cliff_duration,
+            &slot0.start_time,
+            &slot0.kind,
+            &slot0.revocable,
+            &tampered,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), VestFlowError::InvalidProof);
+    }
+
+    #[test]
+    fn test_slot_already_claimed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, grantor, token) = setup_batch(&env);
+        let beneficiary = Address::generate(&env);
+
+        set_time(&env, 0);
+        let slot = SlotParams {
+            beneficiary: beneficiary.clone(),
+            total_amount: 1_000,
+            duration: 1_000,
+            cliff_duration: 0,
+            start_time: 0,
+            kind: VestingKind::Linear,
+            revocable: false,
+        };
+        let leaf = slot_leaf(&env, &slot);
+        let batch_id = client.commit_schedule_batch(&grantor, &token, &1_000, &leaf, &1_000_000);
+
+        let empty_proof: Vec<BytesN<32>> = Vec::new(&env);
+        client.claim_schedule_slot(
+            &batch_id,
+            &beneficiary,
+            &slot.total_amount,
+            &slot.duration,
+            &slot.cliff_duration,
+            &slot.start_time,
+            &slot.kind,
+            &slot.revocable,
+            &empty_proof,
+        );
+
+        let result = client.try_claim_schedule_slot(
+            &batch_id,
+            &beneficiary,
+            &slot.total_amount,
+            &slot.duration,
+            &slot.cliff_duration,
+            &slot.start_time,
+            &slot.kind,
+            &slot.revocable,
+            &empty_proof,
+        );
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            VestFlowError::SlotAlreadyClaimed
+        );
+    }
+
+    #[test]
+    fn test_reclaim_before_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, grantor, token) = setup_batch(&env);
+        let beneficiary = Address::generate(&env);
+
+        set_time(&env, 0);
+        let slot = SlotParams {
+            beneficiary,
+            total_amount: 1_000,
+            duration: 1_000,
+            cliff_duration: 0,
+            start_time: 0,
+            kind: VestingKind::Linear,
+            revocable: false,
+        };
+        let leaf = slot_leaf(&env, &slot);
+        env.ledger().set(LedgerInfo {
+            timestamp: 0,
+            protocol_version: 22,
+            sequence_number: 100,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 10,
+            min_persistent_entry_ttl: 10,
+            max_entry_ttl: 3110400,
+        });
+        let batch_id = client.commit_schedule_batch(&grantor, &token, &1_000, &leaf, &200);
+
+        let result = client.try_reclaim_batch(&batch_id, &grantor);
+        assert_eq!(result.unwrap_err().unwrap(), VestFlowError::NotExpired);
+    }
+
+    #[test]
+    fn test_reclaim_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, grantor, token) = setup_batch(&env);
+        let beneficiary = Address::generate(&env);
+
+        set_time(&env, 0);
+        env.ledger().set(LedgerInfo {
+            timestamp: 0,
+            protocol_version: 22,
+            sequence_number: 100,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 10,
+            min_persistent_entry_ttl: 10,
+            max_entry_ttl: 3110400,
+        });
+        let slot = SlotParams {
+            beneficiary,
+            total_amount: 1_000,
+            duration: 1_000,
+            cliff_duration: 0,
+            start_time: 0,
+            kind: VestingKind::Linear,
+            revocable: false,
+        };
+        let leaf = slot_leaf(&env, &slot);
+        let batch_id = client.commit_schedule_batch(&grantor, &token, &1_000, &leaf, &200);
+
+        env.ledger().set(LedgerInfo {
+            timestamp: 0,
+            protocol_version: 22,
+            sequence_number: 201,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 10,
+            min_persistent_entry_ttl: 10,
+            max_entry_ttl: 3110400,
+        });
+
+        let token_client = TokenClient::new(&env, &token);
+        let before = token_client.balance(&grantor);
+        client.reclaim_batch(&batch_id, &grantor);
+        let after = token_client.balance(&grantor);
+        assert_eq!(after - before, 1_000);
+    }
+
+    #[test]
+    fn test_claim_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, grantor, token) = setup_batch(&env);
+        let beneficiary = Address::generate(&env);
+
+        env.ledger().set(LedgerInfo {
+            timestamp: 0,
+            protocol_version: 22,
+            sequence_number: 100,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 10,
+            min_persistent_entry_ttl: 10,
+            max_entry_ttl: 3110400,
+        });
+        let slot = SlotParams {
+            beneficiary: beneficiary.clone(),
+            total_amount: 1_000,
+            duration: 1_000,
+            cliff_duration: 0,
+            start_time: 0,
+            kind: VestingKind::Linear,
+            revocable: false,
+        };
+        let leaf = slot_leaf(&env, &slot);
+        let batch_id = client.commit_schedule_batch(&grantor, &token, &1_000, &leaf, &200);
+
+        env.ledger().set(LedgerInfo {
+            timestamp: 0,
+            protocol_version: 22,
+            sequence_number: 201,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 10,
+            min_persistent_entry_ttl: 10,
+            max_entry_ttl: 3110400,
+        });
+
+        let empty_proof: Vec<BytesN<32>> = Vec::new(&env);
+        let result = client.try_claim_schedule_slot(
+            &batch_id,
+            &beneficiary,
+            &slot.total_amount,
+            &slot.duration,
+            &slot.cliff_duration,
+            &slot.start_time,
+            &slot.kind,
+            &slot.revocable,
+            &empty_proof,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), VestFlowError::BatchExpired);
+    }
+
+    #[test]
+    fn test_proof_too_deep() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, grantor, token) = setup_batch(&env);
+        let beneficiary = Address::generate(&env);
+
+        set_time(&env, 0);
+        let slot = SlotParams {
+            beneficiary: beneficiary.clone(),
+            total_amount: 1_000,
+            duration: 1_000,
+            cliff_duration: 0,
+            start_time: 0,
+            kind: VestingKind::Linear,
+            revocable: false,
+        };
+        let leaf = slot_leaf(&env, &slot);
+        let batch_id = client.commit_schedule_batch(&grantor, &token, &1_000, &leaf, &1_000_000);
+
+        let mut deep_proof: Vec<BytesN<32>> = Vec::new(&env);
+        for i in 0..21u8 {
+            deep_proof.push_back(BytesN::from_array(&env, &[i; 32]));
+        }
+
+        let result = client.try_claim_schedule_slot(
+            &batch_id,
+            &beneficiary,
+            &slot.total_amount,
+            &slot.duration,
+            &slot.cliff_duration,
+            &slot.start_time,
+            &slot.kind,
+            &slot.revocable,
+            &deep_proof,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), VestFlowError::ProofTooDeep);
+    }
+
+    #[test]
+    fn test_cross_check_typescript_builder() {
+        // Fixture mirrors the beneficiaries/amounts produced by
+        // `scripts/merkle-batch.ts` against its own fixture CSV, so a passing
+        // run here proves the two encoders agree byte-for-byte.
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, grantor, token) = setup_batch(&env);
+
+        set_time(&env, 0);
+        let mut slots: std::vec::Vec<SlotParams> = std::vec::Vec::new();
+        let mut leaves: Vec<BytesN<32>> = Vec::new(&env);
+        let fixture_amounts: [i128; 3] = [5_000_000, 12_345_000, 999_999_999];
+        for amount in fixture_amounts {
+            let slot = SlotParams {
+                beneficiary: Address::generate(&env),
+                total_amount: amount,
+                duration: 31_536_000,
+                cliff_duration: 7_776_000,
+                start_time: 0,
+                kind: VestingKind::LinearWithCliff,
+                revocable: true,
+            };
+            leaves.push_back(slot_leaf(&env, &slot));
+            slots.push(slot);
+        }
+
+        let (root, proofs) = build_merkle(&env, &leaves);
+        let total: i128 = slots.iter().map(|s| s.total_amount).sum();
+        let batch_id = client.commit_schedule_batch(&grantor, &token, &total, &root, &1_000_000);
+
+        for i in 0..slots.len() as u32 {
+            let slot = &slots[i as usize];
+            let proof = proofs.get(i).unwrap();
+            let schedule_id = client.claim_schedule_slot(
+                &batch_id,
+                &slot.beneficiary,
+                &slot.total_amount,
+                &slot.duration,
+                &slot.cliff_duration,
+                &slot.start_time,
+                &slot.kind,
+                &slot.revocable,
+                &proof,
+            );
+            let schedule = client.get_schedule(&schedule_id);
+            assert_eq!(schedule.total_amount, slot.total_amount);
+            assert_eq!(schedule.duration_seconds, slot.duration);
+            assert_eq!(schedule.cliff_seconds, slot.cliff_duration);
+            assert_eq!(schedule.revocable, slot.revocable);
+        }
     }
 }
