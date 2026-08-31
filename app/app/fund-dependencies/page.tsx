@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import Navbar from "@/components/Navbar";
-import { getGrantorScheduleIds, getScheduleBatch, stroopsToXlm } from "@/lib/stellar";
+import { getGrantorScheduleIds, getScheduleBatch, getWalletXlmBalance, stroopsToXlm } from "@/lib/stellar";
 import { useWallet } from "@/lib/WalletContext";
 import TopUpModal from "@/components/TopUpModal";
 
