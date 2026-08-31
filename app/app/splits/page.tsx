@@ -108,7 +108,7 @@ export default function SplitsPage() {
             </div>
 
             <SplitsPieChart
-              receivers={splits.receivers}
+              receivers={splits.receivers.map(r => ({ address: r.address, weightBps: r.weight_bps }))}
               selectedAddress={selectedAddress}
               onSelect={setSelectedAddress}
             />
