@@ -4755,7 +4755,7 @@ mod test {
     use soroban_sdk::{
         testutils::{Address as _, Events as _, Ledger, LedgerInfo},
         token::{Client as TokenClient, StellarAssetClient},
-        Env, IntoVal,
+        Env, IntoVal, TryIntoVal,
     };
 
     fn setup(
@@ -4778,6 +4778,20 @@ mod test {
             .mock_all_auths()
             .mint(&grantor, &10_000);
         (client, grantor, beneficiary, token_address, token_admin)
+    }
+
+    fn create_token_contract(env: &Env, admin: &Address) -> Address {
+        env.register_stellar_asset_contract_v2(admin.clone()).address()
+    }
+
+    fn decode_strm_recv_topics(
+        env: &Env,
+        topics: &Vec<soroban_sdk::Val>,
+    ) -> (soroban_sdk::Symbol, Address, Address) {
+        let symbol: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(env).unwrap();
+        let account: Address = topics.get(1).unwrap().try_into_val(env).unwrap();
+        let token: Address = topics.get(2).unwrap().try_into_val(env).unwrap();
+        (symbol, account, token)
     }
 
     fn set_time(env: &Env, ts: u64) {
@@ -9908,12 +9922,12 @@ mod test {
         let funder = Address::generate(&env);
         let receiver = Address::generate(&env);
         let token_address = create_token_contract(&env, &funder);
-        let token_client = token::Client::new(&env, &token_address);
 
         // Fund the contract
         let deposit = 1_000_000_i128;
-        token_client.mint(&funder, &deposit);
-        token_client.transfer(&funder, &client.address, &deposit);
+        StellarAssetClient::new(&env, &token_address)
+            .mock_all_auths()
+            .mint(&funder, &deposit);
 
         // Set up stream
         let rate = 100i128;
@@ -9924,11 +9938,10 @@ mod test {
                 amt_per_sec: rate,
             },
         ];
-        client.set_stream(&funder, &token_address, &receivers_vec);
 
         // Wait for more than one cycle (CYCLE_SECS = 7 days = 604800 seconds)
         set_time(&env, 0);
-        client.set_stream(&funder, &token_address, &receivers_vec);
+        client.set_stream(&funder, &token_address, &receivers_vec, &deposit);
         set_time(&env, 700_000); // More than 1 cycle
 
         // Receive streams
@@ -9936,11 +9949,11 @@ mod test {
 
         // Verify event was emitted
         let events = env.events().all();
-        let event = events.last().unwrap();
+        let (_, topics, data) = events.last().unwrap();
 
         // Event topics should be (symbol, funder, token)
-        let (topics, data): ((soroban_sdk::Symbol, Address, Address), (u32, i128)) =
-            event.clone().try_into().unwrap();
+        let topics = decode_strm_recv_topics(&env, &topics);
+        let data: (u32, i128) = data.try_into_val(&env).unwrap();
         assert_eq!(topics.0, symbol_short!("strm_recv"));
         assert_eq!(topics.1, funder);
         assert_eq!(topics.2, token_address);
@@ -9963,12 +9976,12 @@ mod test {
         let funder = Address::generate(&env);
         let receiver = Address::generate(&env);
         let token_address = create_token_contract(&env, &funder);
-        let token_client = token::Client::new(&env, &token_address);
 
         // Fund the contract
         let deposit = 1_000_000_i128;
-        token_client.mint(&funder, &deposit);
-        token_client.transfer(&funder, &client.address, &deposit);
+        StellarAssetClient::new(&env, &token_address)
+            .mock_all_auths()
+            .mint(&funder, &deposit);
 
         // Set up stream
         let rate = 100i128;
@@ -9981,10 +9994,7 @@ mod test {
         ];
 
         set_time(&env, 0);
-        client.set_stream(&funder, &token_address, &receivers_vec);
-        
-        // Count events before receive_streams
-        let events_before = env.events().all().len();
+        client.set_stream(&funder, &token_address, &receivers_vec, &deposit);
 
         // Wait less than one cycle (CYCLE_SECS = 604800 seconds)
         set_time(&env, 100_000); // Less than 1 cycle
@@ -9992,19 +10002,10 @@ mod test {
         // Receive streams
         let amount = client.receive_streams(&funder, &token_address, &receivers_vec, &i128::MAX);
 
-        // Count events after - should be the same (no stream_received event)
-        let events_after = env.events().all();
-        
         // Check if any strm_recv event was emitted
-        let has_strm_recv = events_after.iter().any(|event| {
-            if let Ok(((symbol, _, _), _)) = event.clone().try_into() as Result<
-                ((soroban_sdk::Symbol, Address, Address), (u32, i128)),
-                _,
-            > {
-                symbol == symbol_short!("strm_recv")
-            } else {
-                false
-            }
+        let events_after = env.events().all();
+        let has_strm_recv = events_after.iter().any(|(_, topics, _)| {
+            topics.len() == 3 && decode_strm_recv_topics(&env, &topics).0 == symbol_short!("strm_recv")
         });
 
         assert!(!has_strm_recv, "strm_recv event should not be emitted when cycles_processed = 0");
@@ -10019,12 +10020,12 @@ mod test {
         let funder = Address::generate(&env);
         let receiver = Address::generate(&env);
         let token_address = create_token_contract(&env, &funder);
-        let token_client = token::Client::new(&env, &token_address);
 
         // Fund the contract
         let deposit = 100_000_000_i128;
-        token_client.mint(&funder, &deposit);
-        token_client.transfer(&funder, &client.address, &deposit);
+        StellarAssetClient::new(&env, &token_address)
+            .mock_all_auths()
+            .mint(&funder, &deposit);
 
         // Set up stream
         let rate = 100i128;
@@ -10037,7 +10038,7 @@ mod test {
         ];
 
         set_time(&env, 0);
-        client.set_stream(&funder, &token_address, &receivers_vec);
+        client.set_stream(&funder, &token_address, &receivers_vec, &deposit);
 
         // Wait for exactly 3 cycles (3 * 604800 = 1,814,400 seconds)
         set_time(&env, 1_814_400);
@@ -10047,11 +10048,8 @@ mod test {
 
         // Verify event
         let events = env.events().all();
-        let event = events.last().unwrap();
-        let (_, data): ((soroban_sdk::Symbol, Address, Address), (u32, i128)) =
-            event.clone().try_into().unwrap();
-        
-        let cycles_processed = data.0;
+        let (_, _, data) = events.last().unwrap();
+        let (cycles_processed, _): (u32, i128) = data.try_into_val(&env).unwrap();
         assert_eq!(cycles_processed, 3, "Should process exactly 3 cycles");
     }
 
@@ -10063,12 +10061,12 @@ mod test {
         let funder = Address::generate(&env);
         let receiver = Address::generate(&env);
         let token_address = create_token_contract(&env, &funder);
-        let token_client = token::Client::new(&env, &token_address);
 
         // Fund the contract
         let deposit = 10_000_000_i128;
-        token_client.mint(&funder, &deposit);
-        token_client.transfer(&funder, &client.address, &deposit);
+        StellarAssetClient::new(&env, &token_address)
+            .mock_all_auths()
+            .mint(&funder, &deposit);
 
         // Set up stream
         let rate = 50i128;
@@ -10081,7 +10079,7 @@ mod test {
         ];
 
         set_time(&env, 0);
-        client.set_stream(&funder, &token_address, &receivers_vec);
+        client.set_stream(&funder, &token_address, &receivers_vec, &deposit);
         set_time(&env, 1_000_000);
 
         // Receive streams
@@ -10089,12 +10087,12 @@ mod test {
 
         // Verify event structure matches spec
         let events = env.events().all();
-        let event = events.last().unwrap();
+        let (_, topics, value) = events.last().unwrap();
 
         // Topics: [account, token] - represented as (symbol, account, token) in Soroban
-        let (topics, value): ((soroban_sdk::Symbol, Address, Address), (u32, i128)) =
-            event.clone().try_into().unwrap();
-        
+        let topics = decode_strm_recv_topics(&env, &topics);
+        let value: (u32, i128) = value.try_into_val(&env).unwrap();
+
         // Verify topics
         assert_eq!(topics.0, symbol_short!("strm_recv"), "Event symbol should be strm_recv");
         assert_eq!(topics.1, funder, "First topic should be funder (account)");
