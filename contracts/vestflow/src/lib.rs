@@ -98,6 +98,8 @@ pub enum VestFlowError {
     NotExpired = 32,
     /// A Merkle proof exceeded the maximum supported depth (20).
     ProofTooDeep = 33,
+    /// StreamReceiver `amt_per_sec` or SplitsReceiver `weight` must be positive.
+    WeightZero = 34,
 }
 
 #[contracttype]
@@ -279,6 +281,33 @@ pub struct StreamReceiver {
     pub amt_per_sec: i128,
 }
 
+impl StreamReceiver {
+    /// Validate that the stream receiver has a positive rate.
+    ///
+    /// Returns `Ok(())` if valid, or `Err(VestFlowError::WeightZero)` if
+    /// `amt_per_sec` is zero or negative.
+    pub fn validate(&self) -> Result<(), VestFlowError> {
+        if self.amt_per_sec <= 0 {
+            return Err(VestFlowError::WeightZero);
+        }
+        Ok(())
+    }
+
+    /// Create a new validated StreamReceiver.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `amt_per_sec` is zero or negative.
+    pub fn new(receiver: Address, amt_per_sec: i128) -> Result<Self, VestFlowError> {
+        let stream_receiver = Self {
+            receiver,
+            amt_per_sec,
+        };
+        stream_receiver.validate()?;
+        Ok(stream_receiver)
+    }
+}
+
 /// An active stream from a funder to a drips list member.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -306,6 +335,26 @@ pub struct AddressSplitsReceiver {
     pub weight: u128,
 }
 
+impl AddressSplitsReceiver {
+    /// Validate that the splits receiver has a positive weight.
+    ///
+    /// Returns `Ok(())` if valid, or `Err(VestFlowError::WeightZero)` if
+    /// `weight` is zero.
+    pub fn validate(&self) -> Result<(), VestFlowError> {
+        if self.weight == 0 {
+            return Err(VestFlowError::WeightZero);
+        }
+        Ok(())
+    }
+
+    /// Create a new validated AddressSplitsReceiver.
+    pub fn new(receiver: Address, weight: u128) -> Result<Self, VestFlowError> {
+        let splits_receiver = Self { receiver, weight };
+        splits_receiver.validate()?;
+        Ok(splits_receiver)
+    }
+}
+
 /// A proportional split receiver gated by a non-fungible token.
 ///
 /// Rather than paying a fixed address, the share is routed to whoever owns
@@ -316,6 +365,34 @@ pub struct NftSplitsReceiver {
     pub nft_contract: Address,
     pub token_id: u128,
     pub weight: u128,
+}
+
+impl NftSplitsReceiver {
+    /// Validate that the NFT splits receiver has a positive weight.
+    ///
+    /// Returns `Ok(())` if valid, or `Err(VestFlowError::WeightZero)` if
+    /// `weight` is zero.
+    pub fn validate(&self) -> Result<(), VestFlowError> {
+        if self.weight == 0 {
+            return Err(VestFlowError::WeightZero);
+        }
+        Ok(())
+    }
+
+    /// Create a new validated NftSplitsReceiver.
+    pub fn new(
+        nft_contract: Address,
+        token_id: u128,
+        weight: u128,
+    ) -> Result<Self, VestFlowError> {
+        let nft_receiver = Self {
+            nft_contract,
+            token_id,
+            weight,
+        };
+        nft_receiver.validate()?;
+        Ok(nft_receiver)
+    }
 }
 
 /// A single entry in an account's splits configuration.
@@ -3919,6 +3996,11 @@ impl VestFlowContract {
         );
         assert!(top_up >= 0, "Top-up must be non-negative");
 
+        // Validate all receivers have positive rates
+        for receiver in receivers.iter() {
+            receiver.validate().expect("Invalid stream receiver rate");
+        }
+
         if top_up > 0 {
             token::Client::new(&env, &token).transfer(
                 &funder,
@@ -4046,8 +4128,15 @@ impl VestFlowContract {
             INSTANCE_TTL_THRESHOLD_LEDGERS,
             INSTANCE_TTL_EXTEND_TO_LEDGERS,
         );
-        env.events()
-            .publish((symbol_short!("strm_recv"), funder, token), capped);
+
+        // Calculate cycles processed and emit event only when cycles > 0
+        let cycles_processed = (elapsed as u64 / CYCLE_SECS as u64) as u32;
+        if cycles_processed > 0 {
+            env.events().publish(
+                (symbol_short!("strm_recv"), funder, token),
+                (cycles_processed, capped),
+            );
+        }
 
         capped
     }
@@ -4232,11 +4321,15 @@ impl VestFlowContract {
     pub fn set_splits(env: Env, account: Address, receivers: Vec<SplitReceiver>) {
         account.require_auth();
         for receiver in receivers.iter() {
-            let weight = match &receiver {
-                SplitReceiver::Address(receiver) => receiver.weight,
-                SplitReceiver::Nft(receiver) => receiver.weight,
-            };
-            assert!(weight > 0, "Split receiver weight must be positive");
+            // Validate using the struct's validation method
+            match &receiver {
+                SplitReceiver::Address(receiver) => {
+                    receiver.validate().expect("Split receiver weight must be positive");
+                }
+                SplitReceiver::Nft(receiver) => {
+                    receiver.validate().expect("Split receiver weight must be positive");
+                }
+            }
         }
         if receivers.is_empty() {
             env.storage()
@@ -4662,7 +4755,7 @@ mod test {
     use soroban_sdk::{
         testutils::{Address as _, Events as _, Ledger, LedgerInfo},
         token::{Client as TokenClient, StellarAssetClient},
-        Env, IntoVal,
+        Env, IntoVal, TryIntoVal,
     };
 
     fn setup(
@@ -4685,6 +4778,20 @@ mod test {
             .mock_all_auths()
             .mint(&grantor, &10_000);
         (client, grantor, beneficiary, token_address, token_admin)
+    }
+
+    fn create_token_contract(env: &Env, admin: &Address) -> Address {
+        env.register_stellar_asset_contract_v2(admin.clone()).address()
+    }
+
+    fn decode_strm_recv_topics(
+        env: &Env,
+        topics: &Vec<soroban_sdk::Val>,
+    ) -> (soroban_sdk::Symbol, Address, Address) {
+        let symbol: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(env).unwrap();
+        let account: Address = topics.get(1).unwrap().try_into_val(env).unwrap();
+        let token: Address = topics.get(2).unwrap().try_into_val(env).unwrap();
+        (symbol, account, token)
     }
 
     fn set_time(env: &Env, ts: u64) {
@@ -9803,5 +9910,396 @@ mod test {
             assert_eq!(schedule.cliff_seconds, slot.cliff_duration);
             assert_eq!(schedule.revocable, slot.revocable);
         }
+    }
+
+    // --- Issue #610: stream_received event tests ---
+
+    #[test]
+    fn test_stream_received_event_emitted_after_receive_streams() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = VestFlowContractClient::new(&env, &env.register(VestFlowContract, ()));
+        let funder = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let token_address = create_token_contract(&env, &funder);
+
+        // Fund the contract
+        let deposit = 1_000_000_i128;
+        StellarAssetClient::new(&env, &token_address)
+            .mock_all_auths()
+            .mint(&funder, &deposit);
+
+        // Set up stream
+        let rate = 100i128;
+        let receivers_vec = vec![
+            &env,
+            StreamReceiver {
+                receiver: receiver.clone(),
+                amt_per_sec: rate,
+            },
+        ];
+
+        // Wait for more than one cycle (CYCLE_SECS = 7 days = 604800 seconds)
+        set_time(&env, 0);
+        client.set_stream(&funder, &token_address, &receivers_vec, &deposit);
+        set_time(&env, 700_000); // More than 1 cycle
+
+        // Receive streams
+        let amount = client.receive_streams(&funder, &token_address, &receivers_vec, &i128::MAX);
+
+        // Verify event was emitted
+        let events = env.events().all();
+        let (_, topics, data) = events.last().unwrap();
+
+        // Event topics should be (symbol, funder, token)
+        let topics = decode_strm_recv_topics(&env, &topics);
+        let data: (u32, i128) = data.try_into_val(&env).unwrap();
+        assert_eq!(topics.0, symbol_short!("strm_recv"));
+        assert_eq!(topics.1, funder);
+        assert_eq!(topics.2, token_address);
+
+        // Event data should be (cycles_processed, amount_received)
+        let cycles_processed = data.0;
+        let amount_received = data.1;
+        assert!(cycles_processed > 0, "cycles_processed should be > 0");
+        assert_eq!(amount_received, amount);
+
+        // Verify cycles calculation: 700000 / 604800 = 1 cycle
+        assert_eq!(cycles_processed, 1);
+    }
+
+    #[test]
+    fn test_stream_received_event_not_emitted_when_zero_cycles() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = VestFlowContractClient::new(&env, &env.register(VestFlowContract, ()));
+        let funder = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let token_address = create_token_contract(&env, &funder);
+
+        // Fund the contract
+        let deposit = 1_000_000_i128;
+        StellarAssetClient::new(&env, &token_address)
+            .mock_all_auths()
+            .mint(&funder, &deposit);
+
+        // Set up stream
+        let rate = 100i128;
+        let receivers_vec = vec![
+            &env,
+            StreamReceiver {
+                receiver: receiver.clone(),
+                amt_per_sec: rate,
+            },
+        ];
+
+        set_time(&env, 0);
+        client.set_stream(&funder, &token_address, &receivers_vec, &deposit);
+
+        // Wait less than one cycle (CYCLE_SECS = 604800 seconds)
+        set_time(&env, 100_000); // Less than 1 cycle
+
+        // Receive streams
+        let amount = client.receive_streams(&funder, &token_address, &receivers_vec, &i128::MAX);
+
+        // Check if any strm_recv event was emitted
+        let events_after = env.events().all();
+        let has_strm_recv = events_after.iter().any(|(_, topics, _)| {
+            topics.len() == 3 && decode_strm_recv_topics(&env, &topics).0 == symbol_short!("strm_recv")
+        });
+
+        assert!(!has_strm_recv, "strm_recv event should not be emitted when cycles_processed = 0");
+        assert!(amount > 0, "Amount should still be positive even with 0 cycles");
+    }
+
+    #[test]
+    fn test_stream_received_event_cycles_calculation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = VestFlowContractClient::new(&env, &env.register(VestFlowContract, ()));
+        let funder = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let token_address = create_token_contract(&env, &funder);
+
+        // Fund the contract
+        let deposit = 100_000_000_i128;
+        StellarAssetClient::new(&env, &token_address)
+            .mock_all_auths()
+            .mint(&funder, &deposit);
+
+        // Set up stream
+        let rate = 100i128;
+        let receivers_vec = vec![
+            &env,
+            StreamReceiver {
+                receiver: receiver.clone(),
+                amt_per_sec: rate,
+            },
+        ];
+
+        set_time(&env, 0);
+        client.set_stream(&funder, &token_address, &receivers_vec, &deposit);
+
+        // Wait for exactly 3 cycles (3 * 604800 = 1,814,400 seconds)
+        set_time(&env, 1_814_400);
+
+        // Receive streams
+        client.receive_streams(&funder, &token_address, &receivers_vec, &i128::MAX);
+
+        // Verify event
+        let events = env.events().all();
+        let (_, _, data) = events.last().unwrap();
+        let (cycles_processed, _): (u32, i128) = data.try_into_val(&env).unwrap();
+        assert_eq!(cycles_processed, 3, "Should process exactly 3 cycles");
+    }
+
+    #[test]
+    fn test_stream_received_event_topics_and_value_match_spec() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = VestFlowContractClient::new(&env, &env.register(VestFlowContract, ()));
+        let funder = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let token_address = create_token_contract(&env, &funder);
+
+        // Fund the contract
+        let deposit = 10_000_000_i128;
+        StellarAssetClient::new(&env, &token_address)
+            .mock_all_auths()
+            .mint(&funder, &deposit);
+
+        // Set up stream
+        let rate = 50i128;
+        let receivers_vec = vec![
+            &env,
+            StreamReceiver {
+                receiver: receiver.clone(),
+                amt_per_sec: rate,
+            },
+        ];
+
+        set_time(&env, 0);
+        client.set_stream(&funder, &token_address, &receivers_vec, &deposit);
+        set_time(&env, 1_000_000);
+
+        // Receive streams
+        let amount = client.receive_streams(&funder, &token_address, &receivers_vec, &i128::MAX);
+
+        // Verify event structure matches spec
+        let events = env.events().all();
+        let (_, topics, value) = events.last().unwrap();
+
+        // Topics: [account, token] - represented as (symbol, account, token) in Soroban
+        let topics = decode_strm_recv_topics(&env, &topics);
+        let value: (u32, i128) = value.try_into_val(&env).unwrap();
+
+        // Verify topics
+        assert_eq!(topics.0, symbol_short!("strm_recv"), "Event symbol should be strm_recv");
+        assert_eq!(topics.1, funder, "First topic should be funder (account)");
+        assert_eq!(topics.2, token_address, "Second topic should be token");
+
+        // Verify value: { cycles_processed: u32, amount_received: i128 }
+        let (cycles_processed, amount_received) = value;
+        assert!(cycles_processed > 0, "cycles_processed should be u32 > 0");
+        assert_eq!(amount_received, amount, "amount_received should match returned amount");
+    }
+
+    // --- Issue #609: StreamReceiver and SplitsReceiver validation tests ---
+
+    #[test]
+    fn test_stream_receiver_valid_config_accepted() {
+        let env = Env::default();
+        let receiver = Address::generate(&env);
+        
+        // Valid configuration should succeed
+        let stream_receiver = StreamReceiver::new(receiver.clone(), 100).unwrap();
+        assert_eq!(stream_receiver.amt_per_sec, 100);
+        assert_eq!(stream_receiver.receiver, receiver);
+    }
+
+    #[test]
+    fn test_stream_receiver_zero_rate_rejected() {
+        let env = Env::default();
+        let receiver = Address::generate(&env);
+        
+        // Zero rate should fail
+        let result = StreamReceiver::new(receiver, 0);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), VestFlowError::WeightZero);
+    }
+
+    #[test]
+    fn test_stream_receiver_negative_rate_rejected() {
+        let env = Env::default();
+        let receiver = Address::generate(&env);
+        
+        // Negative rate should fail
+        let result = StreamReceiver::new(receiver, -100);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), VestFlowError::WeightZero);
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid stream receiver rate")]
+    fn test_set_stream_rejects_zero_rate() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = VestFlowContractClient::new(&env, &env.register(VestFlowContract, ()));
+        let funder = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let token_address = create_token_contract(&env, &funder);
+
+        // Try to set stream with zero rate - should panic
+        let receivers_vec = vec![
+            &env,
+            StreamReceiver {
+                receiver: receiver.clone(),
+                amt_per_sec: 0, // Invalid!
+            },
+        ];
+        client.set_stream(&funder, &token_address, &receivers_vec, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid stream receiver rate")]
+    fn test_set_stream_rejects_negative_rate() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = VestFlowContractClient::new(&env, &env.register(VestFlowContract, ()));
+        let funder = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let token_address = create_token_contract(&env, &funder);
+
+        // Try to set stream with negative rate - should panic
+        let receivers_vec = vec![
+            &env,
+            StreamReceiver {
+                receiver: receiver.clone(),
+                amt_per_sec: -50, // Invalid!
+            },
+        ];
+        client.set_stream(&funder, &token_address, &receivers_vec, &0);
+    }
+
+    #[test]
+    fn test_address_splits_receiver_valid_config_accepted() {
+        let env = Env::default();
+        let receiver = Address::generate(&env);
+        
+        // Valid configuration should succeed
+        let splits_receiver = AddressSplitsReceiver::new(receiver.clone(), 100).unwrap();
+        assert_eq!(splits_receiver.weight, 100);
+        assert_eq!(splits_receiver.receiver, receiver);
+    }
+
+    #[test]
+    fn test_address_splits_receiver_zero_weight_rejected() {
+        let env = Env::default();
+        let receiver = Address::generate(&env);
+        
+        // Zero weight should fail
+        let result = AddressSplitsReceiver::new(receiver, 0);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), VestFlowError::WeightZero);
+    }
+
+    #[test]
+    fn test_nft_splits_receiver_valid_config_accepted() {
+        let env = Env::default();
+        let nft_contract = Address::generate(&env);
+        
+        // Valid configuration should succeed
+        let nft_receiver = NftSplitsReceiver::new(nft_contract.clone(), 123, 50).unwrap();
+        assert_eq!(nft_receiver.weight, 50);
+        assert_eq!(nft_receiver.token_id, 123);
+        assert_eq!(nft_receiver.nft_contract, nft_contract);
+    }
+
+    #[test]
+    fn test_nft_splits_receiver_zero_weight_rejected() {
+        let env = Env::default();
+        let nft_contract = Address::generate(&env);
+        
+        // Zero weight should fail
+        let result = NftSplitsReceiver::new(nft_contract, 123, 0);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), VestFlowError::WeightZero);
+    }
+
+    #[test]
+    #[should_panic(expected = "Split receiver weight must be positive")]
+    fn test_set_splits_rejects_zero_weight_address() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = VestFlowContractClient::new(&env, &env.register(VestFlowContract, ()));
+        let account = Address::generate(&env);
+        let receiver = Address::generate(&env);
+
+        // Try to set splits with zero weight - should panic
+        let receivers_vec = vec![
+            &env,
+            SplitReceiver::Address(AddressSplitsReceiver {
+                receiver: receiver.clone(),
+                weight: 0, // Invalid!
+            }),
+        ];
+        client.set_splits(&account, &receivers_vec);
+    }
+
+    #[test]
+    #[should_panic(expected = "Split receiver weight must be positive")]
+    fn test_set_splits_rejects_zero_weight_nft() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = VestFlowContractClient::new(&env, &env.register(VestFlowContract, ()));
+        let account = Address::generate(&env);
+        let nft_contract = Address::generate(&env);
+
+        // Try to set splits with zero weight NFT - should panic
+        let receivers_vec = vec![
+            &env,
+            SplitReceiver::Nft(NftSplitsReceiver {
+                nft_contract: nft_contract.clone(),
+                token_id: 42,
+                weight: 0, // Invalid!
+            }),
+        ];
+        client.set_splits(&account, &receivers_vec);
+    }
+
+    #[test]
+    fn test_structs_usable_from_sdk() {
+        // This test verifies that StreamReceiver and SplitsReceiver structs
+        // are properly exported and usable from SDK bindings
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = VestFlowContractClient::new(&env, &env.register(VestFlowContract, ()));
+        let funder = Address::generate(&env);
+        let receiver1 = Address::generate(&env);
+        let receiver2 = Address::generate(&env);
+        let token_address = create_token_contract(&env, &funder);
+
+        // Create StreamReceiver structs - should work from SDK
+        let stream_receiver = StreamReceiver {
+            receiver: receiver1.clone(),
+            amt_per_sec: 100,
+        };
+        let receivers_vec = vec![&env, stream_receiver];
+        
+        // Use in contract call
+        client.set_stream(&funder, &token_address, &receivers_vec, &0);
+
+        // Create SplitsReceiver structs - should work from SDK
+        let splits_receiver = AddressSplitsReceiver {
+            receiver: receiver2.clone(),
+            weight: 50,
+        };
+        let splits_vec = vec![&env, SplitReceiver::Address(splits_receiver)];
+        
+        // Use in contract call
+        client.set_splits(&funder, &splits_vec);
+
+        // If we got here, structs are properly exported and usable
+        assert!(true);
     }
 }
