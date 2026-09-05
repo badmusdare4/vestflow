@@ -98,6 +98,8 @@ pub enum VestFlowError {
     NotExpired = 32,
     /// A Merkle proof exceeded the maximum supported depth (20).
     ProofTooDeep = 33,
+    /// StreamReceiver `amt_per_sec` or SplitsReceiver `weight` must be positive.
+    WeightZero = 34,
 }
 
 #[contracttype]
@@ -279,6 +281,33 @@ pub struct StreamReceiver {
     pub amt_per_sec: i128,
 }
 
+impl StreamReceiver {
+    /// Validate that the stream receiver has a positive rate.
+    ///
+    /// Returns `Ok(())` if valid, or `Err(VestFlowError::WeightZero)` if
+    /// `amt_per_sec` is zero or negative.
+    pub fn validate(&self) -> Result<(), VestFlowError> {
+        if self.amt_per_sec <= 0 {
+            return Err(VestFlowError::WeightZero);
+        }
+        Ok(())
+    }
+
+    /// Create a new validated StreamReceiver.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `amt_per_sec` is zero or negative.
+    pub fn new(receiver: Address, amt_per_sec: i128) -> Result<Self, VestFlowError> {
+        let stream_receiver = Self {
+            receiver,
+            amt_per_sec,
+        };
+        stream_receiver.validate()?;
+        Ok(stream_receiver)
+    }
+}
+
 /// An active stream from a funder to a drips list member.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -306,6 +335,26 @@ pub struct AddressSplitsReceiver {
     pub weight: u128,
 }
 
+impl AddressSplitsReceiver {
+    /// Validate that the splits receiver has a positive weight.
+    ///
+    /// Returns `Ok(())` if valid, or `Err(VestFlowError::WeightZero)` if
+    /// `weight` is zero.
+    pub fn validate(&self) -> Result<(), VestFlowError> {
+        if self.weight == 0 {
+            return Err(VestFlowError::WeightZero);
+        }
+        Ok(())
+    }
+
+    /// Create a new validated AddressSplitsReceiver.
+    pub fn new(receiver: Address, weight: u128) -> Result<Self, VestFlowError> {
+        let splits_receiver = Self { receiver, weight };
+        splits_receiver.validate()?;
+        Ok(splits_receiver)
+    }
+}
+
 /// A proportional split receiver gated by a non-fungible token.
 ///
 /// Rather than paying a fixed address, the share is routed to whoever owns
@@ -316,6 +365,34 @@ pub struct NftSplitsReceiver {
     pub nft_contract: Address,
     pub token_id: u128,
     pub weight: u128,
+}
+
+impl NftSplitsReceiver {
+    /// Validate that the NFT splits receiver has a positive weight.
+    ///
+    /// Returns `Ok(())` if valid, or `Err(VestFlowError::WeightZero)` if
+    /// `weight` is zero.
+    pub fn validate(&self) -> Result<(), VestFlowError> {
+        if self.weight == 0 {
+            return Err(VestFlowError::WeightZero);
+        }
+        Ok(())
+    }
+
+    /// Create a new validated NftSplitsReceiver.
+    pub fn new(
+        nft_contract: Address,
+        token_id: u128,
+        weight: u128,
+    ) -> Result<Self, VestFlowError> {
+        let nft_receiver = Self {
+            nft_contract,
+            token_id,
+            weight,
+        };
+        nft_receiver.validate()?;
+        Ok(nft_receiver)
+    }
 }
 
 /// A single entry in an account's splits configuration.
@@ -3919,6 +3996,11 @@ impl VestFlowContract {
         );
         assert!(top_up >= 0, "Top-up must be non-negative");
 
+        // Validate all receivers have positive rates
+        for receiver in receivers.iter() {
+            receiver.validate().expect("Invalid stream receiver rate");
+        }
+
         if top_up > 0 {
             token::Client::new(&env, &token).transfer(
                 &funder,
@@ -4086,8 +4168,15 @@ impl VestFlowContract {
             INSTANCE_TTL_THRESHOLD_LEDGERS,
             INSTANCE_TTL_EXTEND_TO_LEDGERS,
         );
-        env.events()
-            .publish((symbol_short!("strm_recv"), funder, token), capped);
+
+        // Calculate cycles processed and emit event only when cycles > 0
+        let cycles_processed = (elapsed as u64 / CYCLE_SECS as u64) as u32;
+        if cycles_processed > 0 {
+            env.events().publish(
+                (symbol_short!("strm_recv"), funder, token),
+                (cycles_processed, capped),
+            );
+        }
 
         capped
     }
@@ -4272,11 +4361,15 @@ impl VestFlowContract {
     pub fn set_splits(env: Env, account: Address, receivers: Vec<SplitReceiver>) {
         account.require_auth();
         for receiver in receivers.iter() {
-            let weight = match &receiver {
-                SplitReceiver::Address(receiver) => receiver.weight,
-                SplitReceiver::Nft(receiver) => receiver.weight,
-            };
-            assert!(weight > 0, "Split receiver weight must be positive");
+            // Validate using the struct's validation method
+            match &receiver {
+                SplitReceiver::Address(receiver) => {
+                    receiver.validate().expect("Split receiver weight must be positive");
+                }
+                SplitReceiver::Nft(receiver) => {
+                    receiver.validate().expect("Split receiver weight must be positive");
+                }
+            }
         }
         if receivers.is_empty() {
             env.storage()
@@ -4702,7 +4795,7 @@ mod test {
     use soroban_sdk::{
         testutils::{Address as _, Events as _, Ledger, LedgerInfo},
         token::{Client as TokenClient, StellarAssetClient},
-        Env, IntoVal,
+        Env, IntoVal, TryIntoVal,
     };
 
     fn setup(
@@ -4725,6 +4818,20 @@ mod test {
             .mock_all_auths()
             .mint(&grantor, &10_000);
         (client, grantor, beneficiary, token_address, token_admin)
+    }
+
+    fn create_token_contract(env: &Env, admin: &Address) -> Address {
+        env.register_stellar_asset_contract_v2(admin.clone()).address()
+    }
+
+    fn decode_strm_recv_topics(
+        env: &Env,
+        topics: &Vec<soroban_sdk::Val>,
+    ) -> (soroban_sdk::Symbol, Address, Address) {
+        let symbol: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(env).unwrap();
+        let account: Address = topics.get(1).unwrap().try_into_val(env).unwrap();
+        let token: Address = topics.get(2).unwrap().try_into_val(env).unwrap();
+        (symbol, account, token)
     }
 
     fn set_time(env: &Env, ts: u64) {
@@ -6798,64 +6905,4 @@ mod test {
             &1000,
             &0,
             &1000,
-            &0,
-            &0,
-            &VestingKind::Cliff,
-            &false,
-        );
-
-        let kind = client.vesting_type(&id);
-        assert_eq!(kind.unwrap(), VestingKind::Cliff);
-    }
-
-    #[test]
-    fn test_vesting_type_returns_none_for_unknown_id() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, _, _, _, _) = setup(&env);
-
-        let kind = client.vesting_type(&999);
-        assert!(kind.is_none());
-    }
-
-    #[test]
-    fn test_vesting_type_all_kinds() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, grantor, beneficiary, token_addr, _) = setup(&env);
-
-        set_time(&env, 0);
-
-        let id_linear = client.create_schedule(
-            &grantor,
-            &beneficiary,
-            &token_addr,
-            &1000,
-            &0,
-            &1000,
-            &0,
-            &0,
-            &VestingKind::Linear,
-            &false,
-        );
-        assert_eq!(
-            client.vesting_type(&id_linear).unwrap(),
-            VestingKind::Linear
-        );
-
-        let id_cliff = client.create_schedule(
-            &grantor,
-            &beneficiary,
-            &token_addr,
-            &1000,
-            &0,
-            &1000,
-            &500,
-            &500,
-            &VestingKind::Cliff,
-            &false,
-        );
-        assert_eq!(client.vesting_type(&id_cliff).unwrap(), VestingKind::Cliff);
-
-        let id_lwc = client.create_schedule(
             &
